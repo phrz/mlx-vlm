@@ -264,6 +264,7 @@ class GenerationResult:
     diffusion_work_tps: float = 0.0
     is_draft: bool = False
     draft_text: str = ""
+    draft_blocks: Optional[List[str]] = None
     text_already_printed: bool = False
     diffusion_step: int = 0
     diffusion_total_steps: int = 0

@@ -850,6 +850,16 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    x_stream_draft_blocks: bool = Field(
+        False,
+        description=(
+            "Opt in to draft-block streaming: emit extra chunks whose delta "
+            "carries only x_draft_blocks — the not-yet-committed diffusion "
+            'blocks\' current text, with "░" for each still-masked position. '
+            "Only meaningful when stream=true and the loaded model is a "
+            "block-diffusion family; silently ignored otherwise."
+        ),
+    )
 
 
 class TopLogprob(BaseModel):

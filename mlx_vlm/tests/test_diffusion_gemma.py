@@ -1909,6 +1909,86 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
             [("Hi.", "stop")],
         )
 
+    def test_decode_diffusion_draft_block_renders_placeholders(self):
+        from mlx_vlm.generate.diffusion import _decode_diffusion_draft_block
+
+        text = _decode_diffusion_draft_block(
+            FakeTokenizer(),
+            [0, 1, 2, 3, 4],
+            [True, False, False, True, True],
+            skip_special_token_ids={3},
+        )
+        # Revealed runs decode normally (special token 3 skipped); each
+        # masked position renders one "░".
+        self.assertEqual(text, "A░░E")
+
+    def test_diffusion_block_chunks_forwards_deduped_draft_blocks(self):
+        from mlx_vlm.generate.common import GenerationResult
+        from mlx_vlm.server.generation import _diffusion_block_chunks
+
+        results = [
+            GenerationResult(is_draft=True, draft_blocks=["░░░"]),
+            GenerationResult(is_draft=True, draft_blocks=["░░░"]),
+            GenerationResult(is_draft=True, draft_blocks=["Hi░"]),
+            GenerationResult(is_draft=True, draft_text="[Mask]"),
+            GenerationResult(text="Hi!", token=4, diffusion_canvas_index=1),
+            GenerationResult(diffusion_block_complete=True, diffusion_canvas_index=1),
+            GenerationResult(text="", finish_reason="stop", token=4),
+        ]
+
+        chunks = list(_diffusion_block_chunks(iter(results)))
+        self.assertEqual(
+            [(c.draft_blocks, c.text, c.finish_reason) for c in chunks],
+            [
+                (["░░░"], "", None),
+                (["Hi░"], "", None),
+                (None, "Hi!", None),
+                (None, "", "stop"),
+            ],
+        )
+        self.assertTrue(all(c.token_count == 0 for c in chunks if c.draft_blocks))
+
+    def test_stream_generate_can_emit_draft_blocks(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        def run(**extra):
+            mx.random.seed(7)
+            return list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                    max_denoising_steps=2,
+                    **extra,
+                )
+            )
+
+        responses = run(diffusion_draft_blocks=True)
+        drafts = [response for response in responses if response.is_draft]
+        finals = [response for response in responses if not response.is_draft]
+
+        self.assertTrue(drafts)
+        self.assertTrue(all(len(r.draft_blocks) == 1 for r in drafts))
+        # The step-0 draft is a fully masked canvas: one "░" per position.
+        self.assertEqual(drafts[0].draft_blocks, ["░░░"])
+        # No CLI-visualizer text on wire drafts.
+        self.assertTrue(all(r.draft_text == "" for r in drafts))
+        self.assertEqual(finals[-1].generation_tokens, 2)
+
+        # Committed text is identical to a run without the flag.
+        self.assertEqual(
+            "".join(r.text for r in finals),
+            "".join(r.text for r in run()),
+        )
+
 
 class TestDiffusionGemma4Quantized(unittest.TestCase):
     def test_quant_predicate_uses_8bit_for_embeddings_and_attention(self):

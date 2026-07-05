@@ -645,6 +645,10 @@ class GenerationArguments:
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
     skip_special_tokens: bool = True
+    # Opt-in draft-block streaming: forward in-progress diffusion canvases
+    # as extra chunks. Only block-diffusion models produce drafts; all other
+    # models silently ignore the flag.
+    stream_draft_blocks: bool = False
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
@@ -841,6 +845,8 @@ class StreamingToken:
 
     Diffusion models stream block-by-block: one StreamingToken per denoised
     block, with ``token_count`` carrying the number of tokens in the block.
+    With draft-block streaming opted in, extra tokens carry only
+    ``draft_blocks`` (the not-yet-committed blocks' current text) — no text.
     """
 
     text: str
@@ -858,6 +864,7 @@ class StreamingToken:
     cached_tokens: int = 0
     token_count: int = 1
     emitted_at: Optional[float] = None
+    draft_blocks: Optional[List[str]] = None
 
 
 class _DiffusionBlockEmitter:
@@ -867,9 +874,25 @@ class _DiffusionBlockEmitter:
         self.block_text: List[str] = []
         self.last_token = 0
         self.emitted_tokens = 0
+        self.last_draft_blocks: Optional[List[str]] = None
 
     def feed(self, result) -> "Generator[StreamingToken, None, None]":
         if result.is_draft:
+            # Opt-in wire drafts (x_stream_draft_blocks): forward the canvas
+            # snapshot as a text-less token, skipping repeats whose decoded
+            # text did not change; other drafts are dropped.
+            if result.draft_blocks and result.draft_blocks != self.last_draft_blocks:
+                self.last_draft_blocks = result.draft_blocks
+                yield StreamingToken(
+                    text="",
+                    token=0,
+                    logprobs=None,
+                    finish_reason=None,
+                    peak_memory=result.peak_memory,
+                    prompt_tps=result.prompt_tps,
+                    token_count=0,
+                    draft_blocks=result.draft_blocks,
+                )
             return
         if result.text:
             self.block_text.append(result.text)
@@ -900,7 +923,10 @@ def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
     The diffusion engine emits a canvas's tokens right after that canvas
     finishes denoising, followed by a block-boundary marker. Each completed
     block becomes one StreamingToken; the final token carries the finish
-    reason (plus any text flushed by detokenizer finalization).
+    reason (plus any text flushed by detokenizer finalization). Draft
+    results carrying ``draft_blocks`` (opt-in wire drafts) are forwarded as
+    text-less StreamingTokens, skipping repeats whose decoded text did not
+    change; other drafts are dropped.
     """
     emitter = _DiffusionBlockEmitter()
     for result in results:
@@ -1932,6 +1958,10 @@ class ResponseGenerator:
             stream_kwargs["seed"] = args.seed
         if args.logits_processors is not None:
             stream_kwargs["logits_processors"] = args.logits_processors
+        # Opt-in wire drafts (x_stream_draft_blocks): ask the engine to emit
+        # canvas snapshots as draft results; the emitter forwards them.
+        if args.stream_draft_blocks:
+            stream_kwargs["diffusion_draft_blocks"] = True
         stream_kwargs.update(args.diffusion_kwargs())
         if self.apc_manager is not None and self.apc_mode is not None:
             stream_kwargs["_apc_manager"] = self.apc_manager
