@@ -485,6 +485,41 @@ def _decode_diffusion_masked_draft(
     return escape_carriage_returns(text)
 
 
+def _decode_diffusion_draft_block(
+    tokenizer: PreTrainedTokenizer,
+    token_ids: List[int],
+    reveal_mask: List[bool],
+    skip_special_token_ids,
+) -> str:
+    """Decode an in-progress canvas as wire-ready block text.
+
+    Revealed runs decode normally (skipping special tokens, like the
+    finished-block path); each masked position renders as one "░"
+    placeholder so the ghost text visibly fills in.
+    """
+    skip_ids = set(skip_special_token_ids or [])
+    pieces = []
+    pending_tokens = []
+
+    def flush_tokens():
+        if not pending_tokens:
+            return
+        pieces.append(tokenizer.decode(pending_tokens, skip_special_tokens=False))
+        pending_tokens.clear()
+
+    for token_id, reveal in zip(token_ids, reveal_mask):
+        token_id = int(token_id)
+        if reveal:
+            if token_id not in skip_ids:
+                pending_tokens.append(token_id)
+        else:
+            flush_tokens()
+            pieces.append("░")
+
+    flush_tokens()
+    return "".join(pieces)
+
+
 def stream_diffusion_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -507,6 +542,7 @@ def stream_diffusion_generate(
     diffusion_show_unmasking: bool = False,
     diffusion_unmasking_interval: int = 1,
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    diffusion_draft_blocks: bool = False,
     mm_token_type_ids: Optional[mx.array] = None,
     prefill_step_size: Optional[int] = None,
 ) -> Generator[GenerationResult, None, None]:
@@ -656,6 +692,7 @@ def stream_diffusion_generate(
         *,
         is_draft: bool = False,
         draft_text: str = "",
+        draft_blocks: Optional[List[str]] = None,
         diffusion_step: int = 0,
         diffusion_total_steps: int = 0,
         diffusion_canvas_index: int = 0,
@@ -681,10 +718,43 @@ def stream_diffusion_generate(
             diffusion_work_tps=diffusion_work_tokens / generation_time,
             is_draft=is_draft,
             draft_text=draft_text,
+            draft_blocks=draft_blocks,
             diffusion_step=diffusion_step,
             diffusion_total_steps=diffusion_total_steps,
             diffusion_canvas_index=diffusion_canvas_index,
             diffusion_block_complete=diffusion_block_complete,
+        )
+
+    def make_draft_result(step: int) -> GenerationResult:
+        token_ids = [int(token_id) for token_id in draft_canvas[0].tolist()]
+        reveal_flags = [bool(v) for v in draft_reveal_mask[0].tolist()]
+        draft_text = ""
+        if diffusion_show_unmasking:
+            draft_text = _decode_diffusion_masked_draft(
+                tokenizer,
+                token_ids,
+                reveal_flags,
+                skip_special_token_ids,
+                max_chars=diffusion_unmasking_width,
+            )
+        draft_blocks = None
+        if diffusion_draft_blocks:
+            draft_blocks = [
+                _decode_diffusion_draft_block(
+                    tokenizer,
+                    token_ids,
+                    reveal_flags,
+                    skip_special_token_ids,
+                )
+            ]
+        return make_result(
+            "",
+            is_draft=True,
+            draft_text=draft_text,
+            draft_blocks=draft_blocks,
+            diffusion_step=step,
+            diffusion_total_steps=max_denoising_steps,
+            diffusion_canvas_index=canvas_index,
         )
 
     with mx.stream(generation_stream):
@@ -759,22 +829,8 @@ def stream_diffusion_generate(
             diffusion_history: List[mx.array] = []
             denoising_steps_this_canvas = 0
 
-            if diffusion_show_unmasking:
-                draft_text = _decode_diffusion_masked_draft(
-                    tokenizer,
-                    [int(token_id) for token_id in draft_canvas[0].tolist()],
-                    [False] * canvas_length,
-                    skip_special_token_ids,
-                    max_chars=diffusion_unmasking_width,
-                )
-                yield make_result(
-                    "",
-                    is_draft=True,
-                    draft_text=draft_text,
-                    diffusion_step=0,
-                    diffusion_total_steps=max_denoising_steps,
-                    diffusion_canvas_index=canvas_index,
-                )
+            if diffusion_show_unmasking or diffusion_draft_blocks:
+                yield make_draft_result(0)
 
             for cur_step in reversed(range(1, max_denoising_steps + 1)):
                 denoising_steps_this_canvas += 1
@@ -899,28 +955,16 @@ def stream_diffusion_generate(
                     )
 
                 displayed_step = max_denoising_steps - cur_step + 1
-                should_show_unmasking = diffusion_show_unmasking and (
+                should_emit_draft = (
+                    diffusion_show_unmasking or diffusion_draft_blocks
+                ) and (
                     displayed_step == 1
                     or cur_step == 1
                     or displayed_step % diffusion_unmasking_interval == 0
                 )
-                if should_show_unmasking:
+                if should_emit_draft:
                     mx.eval(draft_canvas, draft_reveal_mask)
-                    draft_text = _decode_diffusion_masked_draft(
-                        tokenizer,
-                        [int(token_id) for token_id in draft_canvas[0].tolist()],
-                        [bool(v) for v in draft_reveal_mask[0].tolist()],
-                        skip_special_token_ids,
-                        max_chars=diffusion_unmasking_width,
-                    )
-                    yield make_result(
-                        "",
-                        is_draft=True,
-                        draft_text=draft_text,
-                        diffusion_step=displayed_step,
-                        diffusion_total_steps=max_denoising_steps,
-                        diffusion_canvas_index=canvas_index,
-                    )
+                    yield make_draft_result(displayed_step)
 
                 if diffusion_sampler == "confidence-threshold" and bool(
                     mx.all(draft_reveal_mask).item()

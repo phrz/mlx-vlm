@@ -2449,6 +2449,143 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
 
 
+def _draft_block_stream_chunks():
+    return [
+        server.StreamingToken(
+            text="",
+            token=0,
+            logprobs=None,
+            finish_reason=None,
+            token_count=0,
+            draft_blocks=["░░░░"],
+        ),
+        server.StreamingToken(
+            text="",
+            token=0,
+            logprobs=None,
+            finish_reason=None,
+            token_count=0,
+            draft_blocks=["He░░"],
+        ),
+        server.StreamingToken(
+            text="Hey.", token=4, logprobs=None, finish_reason=None, token_count=4
+        ),
+        server.StreamingToken(
+            text="", token=4, logprobs=None, finish_reason="stop", token_count=0
+        ),
+    ]
+
+
+def test_chat_completions_streaming_emits_opt_in_draft_block_chunks(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="diffusion_gemma")
+    captured = {}
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            captured["args"] = args
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                _draft_block_stream_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "x_stream_draft_blocks": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["args"].stream_draft_blocks is True
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    # Draft deltas carry only x_draft_blocks — no content key — and come
+    # before the committed block's content delta.
+    draft_deltas = [d for d in deltas if "x_draft_blocks" in d]
+    assert [d["x_draft_blocks"] for d in draft_deltas] == [["░░░░"], ["He░░"]]
+    assert all(set(d) == {"x_draft_blocks"} for d in draft_deltas)
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    content_index = next(
+        i for i, d in enumerate(deltas) if d.get("content") == "Hey."
+    )
+    assert all("x_draft_blocks" not in d for d in deltas[content_index:])
+    assert "".join(d.get("content") or "" for d in deltas) == "Hey."
+
+
+def test_chat_completions_draft_block_flag_requires_streaming(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="diffusion_gemma")
+    captured = {}
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            captured["args"] = args
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="Hey.", token=4, logprobs=None, finish_reason="stop"
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "x_stream_draft_blocks": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["args"].stream_draft_blocks is False
+    payload = response.json()
+    assert payload["choices"][0]["message"]["content"] == "Hey."
+    assert "x_stream_draft_blocks" not in response.text
+
+
 def test_chat_completions_response_uses_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

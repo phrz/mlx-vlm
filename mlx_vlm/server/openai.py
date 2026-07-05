@@ -345,6 +345,38 @@ def _final_chat_chunk(
     )
 
 
+def _draft_chat_chunk_json(
+    request_id: str,
+    model: str,
+    draft_blocks: List[str],
+) -> str:
+    """Serialize an opt-in draft chunk (in-progress diffusion canvases).
+
+    The delta intentionally carries only ``x_draft_blocks`` — no ``content``
+    — so the committed stream is untouched for clients that ignore drafts.
+    """
+    return json.dumps(
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": None,
+                    "delta": {"x_draft_blocks": draft_blocks},
+                    "logprobs": None,
+                }
+            ],
+            "usage": None,
+            "timings": None,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def _chat_usage_chunk(
     request_id: str,
     model: str,
@@ -1671,6 +1703,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+        # Draft-block streaming is stream-only; non-diffusion models never
+        # produce drafts, so the flag is silently ignored elsewhere.
+        gen_args.stream_draft_blocks = bool(
+            request.stream and request.x_stream_draft_blocks
+        )
 
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:
@@ -1769,6 +1806,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
+                            draft_blocks = getattr(token, "draft_blocks", None)
+                            if draft_blocks is not None:
+                                chunk_json = _draft_chat_chunk_json(
+                                    request_id, request.model, draft_blocks
+                                )
+                                yield f"data: {chunk_json}\n\n"
+                                continue
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             metrics.record_chunk(token)
