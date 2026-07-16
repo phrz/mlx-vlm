@@ -67,9 +67,11 @@ class Gemma4AssistantDraftModel(nn.Module):
     def bind(self, target_model) -> "Gemma4AssistantDraftModel":
 
         if self.masked_embedding is not None:
-            embed_w = self.model.embed_tokens.weight
+            # Pass the embedding MODULE (not .weight): quantized checkpoints pack
+            # the table, and MaskedEmbedder dequantizes gathered rows itself.
+            embed = self.model.embed_tokens
             masked = self.masked_embedding
-            self._lm_head_fn = lambda h: masked(h, embed_w)
+            self._lm_head_fn = lambda h: masked(h, embed)
         elif self.config.tie_word_embeddings:
             self._lm_head_fn = self.model.embed_tokens.as_linear
         else:
@@ -273,7 +275,7 @@ class Gemma4AssistantDraftModel(nn.Module):
                     inputs_embeds, shared_kv, position_ids
                 )
                 tok = self.masked_embedding.argmax(
-                    hidden, self.model.embed_tokens.weight
+                    hidden, self.model.embed_tokens
                 )
             else:
                 h_prev, logits = self(inputs_embeds, shared_kv, position_ids)

@@ -2189,6 +2189,30 @@ def test_masked_embedder_argmax_matches_full_sparse_logits():
     assert fast.tolist() == full.tolist()
 
 
+def test_masked_embedder_dequantizes_packed_embedding_rows():
+    """Quantized checkpoints pack the tied embedding table (4-bit x hidden ->
+    uint32 words); indexing it raw used to crash the drafter on token 2 with
+    "[reshape] Cannot reshape array of size ...". The embedder must dequantize
+    the gathered rows and match the dense-table result."""
+    hidden_size, vocab = 64, 128
+    cfg = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab),
+        num_centroids=4,
+        centroid_intermediate_top_k=2,
+    )
+    embedder = MaskedEmbedder(cfg)
+    embedder.token_ordering = mx.arange(vocab, dtype=mx.int32)
+
+    dense = nn.Embedding(vocab, hidden_size)
+    quant = nn.QuantizedEmbedding.from_embedding(dense, group_size=32, bits=8)
+    hidden = mx.random.normal((1, 3, hidden_size))
+
+    fast = embedder.argmax(hidden, quant)
+    assert fast.shape == (1, 3)
+    # 8-bit round-trip is near-lossless: greedy picks must match the dense table.
+    assert fast.tolist() == embedder.argmax(hidden, dense.weight).tolist()
+
+
 def test_format_speculative_stats_includes_variable_draft_rate():
     stats = _format_speculative_stats(
         SimpleNamespace(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])

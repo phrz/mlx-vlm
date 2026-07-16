@@ -46,18 +46,20 @@ class MaskedEmbedder(nn.Module):
         self._freeze_static_buffers()
         return self
 
-    def __call__(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
+    def __call__(self, hidden_states: mx.array, embed_tokens: nn.Module) -> mx.array:
         """Compute sparse logits over the full vocab.
 
         ``hidden_states``: ``[B, L, hidden_size]``.
-        ``lm_head_weight``: ``[vocab_size, hidden_size]`` (tied to the drafter's
-        ``embed_tokens.weight``).
+        ``embed_tokens``: the drafter's tied embedding MODULE (``nn.Embedding``
+        or ``nn.QuantizedEmbedding``) — the module, not its raw ``weight``,
+        because a quantized table is bit-packed and must be dequantized
+        row-wise (see ``_gather_embedding_rows``).
         Returns: ``[B, L, vocab_size]`` with non-selected positions masked
         to ``min(selected_logits) - 1``.
         """
         B, L = hidden_states.shape[:2]
         selected_canonical, selected_logits = self._selected_logits(
-            hidden_states, lm_head_weight
+            hidden_states, embed_tokens
         )
 
         mask_value = float(selected_logits.min().item()) - 1.0
@@ -72,17 +74,43 @@ class MaskedEmbedder(nn.Module):
         # mlx.put_along_axis writes ``src`` at ``index`` along ``axis``.
         return mx.put_along_axis(out, scatter_idx, selected_logits, axis=-1)
 
-    def argmax(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
+    def argmax(self, hidden_states: mx.array, embed_tokens: nn.Module) -> mx.array:
         """Return greedy tokens without materializing full-vocab logits."""
         selected_canonical, selected_logits = self._selected_logits(
-            hidden_states, lm_head_weight
+            hidden_states, embed_tokens
         )
         best = mx.argmax(selected_logits, axis=-1)[..., None]
         selected_canonical = selected_canonical.reshape(*hidden_states.shape[:2], -1)
         return mx.take_along_axis(selected_canonical, best, axis=-1).squeeze(-1)
 
+    @staticmethod
+    def _gather_embedding_rows(embed_tokens: nn.Module, flat_idx: mx.array) -> mx.array:
+        """Rows ``flat_idx`` of the embedding table, dense ``[N, hidden_size]``.
+
+        A ``QuantizedEmbedding``'s ``weight`` is bit-PACKED (4-bit × 256 hidden
+        = 32 uint32 words per row) — indexing it raw and reshaping to
+        ``hidden_size`` is exactly how the ``-4bit`` assistant checkpoints
+        crashed (``[reshape] cannot reshape 131072 into (1,1,4096,256)``).
+        Gather the packed rows plus their per-group scales/biases and
+        dequantize just the selection (top_k·vsc rows) — never the whole
+        262k-row table, which would defeat the sparse head's purpose.
+        """
+        if isinstance(embed_tokens, mx.array):  # raw [vocab, hidden] table
+            return embed_tokens[flat_idx]
+        rows = embed_tokens.weight[flat_idx]
+        if isinstance(embed_tokens, nn.QuantizedEmbedding):
+            return mx.dequantize(
+                rows,
+                embed_tokens.scales[flat_idx],
+                embed_tokens.biases[flat_idx] if hasattr(embed_tokens, "biases") else None,
+                group_size=embed_tokens.group_size,
+                bits=embed_tokens.bits,
+                mode=getattr(embed_tokens, "mode", "affine"),
+            )
+        return rows
+
     def _selected_logits(
-        self, hidden_states: mx.array, lm_head_weight: mx.array
+        self, hidden_states: mx.array, embed_tokens: nn.Module
     ) -> tuple[mx.array, mx.array]:
         B, L = hidden_states.shape[:2]
         # Cluster scores → top-K cluster indices.
@@ -100,10 +128,14 @@ class MaskedEmbedder(nn.Module):
         # selected_canonical: [B, L, top_k, vocab_size_per_centroid]
         selected_canonical = ordering[topk_idx]
 
-        # Gather embeddings: lm_head_weight[selected_canonical] → [B, L, top_k * vsc, hidden]
+        # Gather embeddings (dequantizing if packed) → [B, L, top_k * vsc, hidden].
+        # Cast to the activations' dtype: dequantize yields the scales' dtype,
+        # which needn't match (and put_along_axis wants uniform dtypes anyway).
         flat_idx = selected_canonical.reshape(-1)
-        selected_emb = lm_head_weight[flat_idx].reshape(
-            B, L, self.top_k * self.vocab_size_per_centroid, self.hidden_size
+        selected_emb = (
+            self._gather_embedding_rows(embed_tokens, flat_idx)
+            .reshape(B, L, self.top_k * self.vocab_size_per_centroid, self.hidden_size)
+            .astype(hidden_states.dtype)
         )
 
         # selected_logits = (h @ E.T)
