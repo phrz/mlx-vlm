@@ -183,6 +183,13 @@ class Eagle3DraftModel(nn.Module):
             )
         else:
             self.input_norm = None
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = [
+                nn.RMSNorm(self.target_hidden_size, eps=text_config.rms_norm_eps)
+                for _ in range(3)
+            ]
+        else:
+            self.fc_norm = None
 
         if config.tie_word_embeddings and not self.uses_draft_vocab:
             self.lm_head = None
@@ -260,7 +267,13 @@ class Eagle3DraftModel(nn.Module):
     def _prepare_target_hidden(self, hidden: mx.array) -> mx.array:
         if hidden.shape[-1] == self.hidden_size:
             return hidden
-        if self.input_norm is not None:
+        if self.fc_norm is not None:
+            h = self.target_hidden_size
+            hidden = mx.concatenate(
+                [n(hidden[..., i * h : (i + 1) * h]) for i, n in enumerate(self.fc_norm)],
+                axis=-1,
+            )
+        elif self.input_norm is not None:
             hidden = self.input_norm(hidden)
         return self.fc(hidden)
 
