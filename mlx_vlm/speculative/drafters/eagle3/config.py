@@ -45,6 +45,9 @@ class Eagle3Config(BaseModelConfig):
     tie_word_embeddings: bool = False
     norm_before_residual: bool = False
     norm_before_fc: bool = False
+    # Inferact-style: THREE per-chunk RMSNorms (fc_norm.{0,1,2}) over each aux
+    # hidden before concat->fc, instead of one fused norm over 3*hidden.
+    fc_norm: bool = False
     embed_requires_grad: bool = False
     eagle_aux_hidden_state_layer_ids: Optional[List[int]] = None
     block_size: int = 5
@@ -84,6 +87,17 @@ class Eagle3Config(BaseModelConfig):
 
         if "model_type" not in flat:
             flat["model_type"] = flat.get("speculators_model_type", "eagle3")
+
+        # Flat "LlamaForCausalLMEagle3" checkpoints (e.g. Inferact) put the
+        # transformer fields at the TOP level instead of under
+        # transformer_layer_config. Without lifting them, target_vocab_size falls
+        # back to TextConfig's default (32000) != draft_vocab_size, so the model
+        # spuriously builds a draft-vocab d2t map the checkpoint doesn't ship.
+        if "transformer_layer_config" not in flat:
+            tc_keys = inspect.signature(TextConfig).parameters
+            flat["transformer_layer_config"] = {
+                k: flat[k] for k in tc_keys if k in flat and k != "model_type"
+            }
 
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
