@@ -31,7 +31,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.quantization.one_bit import OneBitLinear
-from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
+from mlx_vlm.speculative.common import _SpeculativeSamplerRNG, _restore_rng_state
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -117,6 +117,21 @@ def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
     assert first.tolist() == expected_first.tolist()
     assert second.tolist() == expected_second.tolist()
     assert draft_model._seed_token is not None
+
+
+def test_speculative_sampler_rng_restores_exact_random_key():
+    logits = mx.zeros((1, 8), dtype=mx.float32)
+
+    mx.random.seed((7 << 32) | 11)
+    saved_state = [mx.array(state) for state in mx.random.state]
+    expected = mx.random.categorical(logits)
+    mx.eval(expected)
+
+    _restore_rng_state(saved_state)
+    replay = mx.random.categorical(logits)
+    mx.eval(replay)
+
+    assert replay.tolist() == expected.tolist()
 
 
 def test_speculative_sampler_rng_can_resync_draft_after_rejected_draws():

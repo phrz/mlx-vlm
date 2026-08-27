@@ -11,8 +11,21 @@ def _copy_rng_state() -> List[mx.array]:
 
 
 def _restore_rng_state(state: List[mx.array]) -> None:
-    for i, value in enumerate(state):
-        mx.random.state[i] = value
+    try:
+        for i, value in enumerate(state):
+            mx.random.state[i] = value
+        return
+    except TypeError:
+        # MLX 0.32 exposes its thread-local RNG state through a read-only
+        # sentinel.  The state remains the two-word key returned by
+        # ``mx.random.key(seed)``, so reconstruct the 64-bit seed and use the
+        # supported setter instead of assigning through the sentinel.
+        if len(state) != 1 or state[0].size != 2:
+            raise RuntimeError(
+                "Cannot restore the MLX RNG state through its read-only API."
+            )
+        high, low = state[0].astype(mx.uint32).tolist()
+        mx.random.seed((int(high) << 32) | int(low))
 
 
 def _append_arrays(value: Any, arrays: List[mx.array]) -> None:
