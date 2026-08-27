@@ -99,10 +99,11 @@ class MaskedEmbedder(nn.Module):
             return embed_tokens[flat_idx]
         rows = embed_tokens.weight[flat_idx]
         if isinstance(embed_tokens, nn.QuantizedEmbedding):
+            biases = getattr(embed_tokens, "biases", None)
             return mx.dequantize(
                 rows,
                 embed_tokens.scales[flat_idx],
-                embed_tokens.biases[flat_idx] if hasattr(embed_tokens, "biases") else None,
+                biases[flat_idx] if biases is not None else None,
                 group_size=embed_tokens.group_size,
                 bits=embed_tokens.bits,
                 mode=getattr(embed_tokens, "mode", "affine"),

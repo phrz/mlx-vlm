@@ -2213,6 +2213,34 @@ def test_masked_embedder_dequantizes_packed_embedding_rows():
     assert fast.tolist() == embedder.argmax(hidden, dense.weight).tolist()
 
 
+def test_masked_embedder_dequantizes_biasless_nvfp4_embedding_rows():
+    """NVFP4 exposes ``biases`` as None rather than omitting the attribute.
+
+    The sparse Gemma assistant head must pass None through to dequantize instead
+    of trying to index it, which crashed the published NVFP4 drafter's first token.
+    """
+    hidden_size, vocab = 64, 128
+    cfg = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab),
+        num_centroids=4,
+        centroid_intermediate_top_k=2,
+    )
+    embedder = MaskedEmbedder(cfg)
+    embedder.token_ordering = mx.arange(vocab, dtype=mx.int32)
+
+    dense = nn.Embedding(vocab, hidden_size)
+    quant = nn.QuantizedEmbedding.from_embedding(
+        dense, group_size=16, bits=4, mode="nvfp4"
+    )
+    assert quant.biases is None
+    hidden = mx.random.normal((1, 3, hidden_size))
+
+    fast = embedder.argmax(hidden, quant)
+    dequantized = quant(mx.arange(vocab, dtype=mx.int32))
+    assert fast.shape == (1, 3)
+    assert fast.tolist() == embedder.argmax(hidden, dequantized).tolist()
+
+
 def test_format_speculative_stats_includes_variable_draft_rate():
     stats = _format_speculative_stats(
         SimpleNamespace(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])
