@@ -273,6 +273,7 @@ class Model(nn.Module):
             diffusion_show_unmasking=(
                 visualize or kwargs.pop("diffusion_show_unmasking", False)
             ),
+            diffusion_draft_blocks=kwargs.pop("diffusion_draft_blocks", False),
             diffusion_unmasking_interval=kwargs.pop("diffusion_unmasking_interval", 1),
             diffusion_unmasking_width=kwargs.pop("diffusion_unmasking_width", 0),
             mm_token_type_ids=mm_token_type_ids,

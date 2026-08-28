@@ -70,14 +70,22 @@ class DiffusionGemma4Processor(Gemma4Processor):
     tokenizer_class = "AutoTokenizer"
     video_processor_class = "Gemma4VideoProcessor"
 
-    def __init__(self, image_processor=None, tokenizer=None, chat_template=None, **kwargs):
-        # Named modality params, not *args: transformers 5.12's
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        chat_template=None,
+        **kwargs,
+    ):
+        # Named modality params, not *args: transformers' ProcessorMixin
         # ProcessorMixin.get_attributes() introspects the signature, and a bare
         # *args/**kwargs makes it return [] — construction fails and AutoProcessor
         # silently degrades to a tokenizer-only processor that DROPS IMAGES.
         super().__init__(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             chat_template=chat_template,
             **kwargs,
         )
