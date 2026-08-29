@@ -58,6 +58,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import mlx.core as mx
 import numpy as np
+from mlx.utils import tree_flatten
 
 from ._stream_cleanup import clear_mlx_streams
 from .apc_coordinator import APCCoordinator
@@ -66,6 +67,12 @@ from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
 
 logger = logging.getLogger("mlx_vlm.apc")
+
+# Coupled servers may inspect this source-level contract marker without
+# importing MLX/Metal. Version 1 guarantees byte-bounded resident APC,
+# explicit checkpoint offsets, zero-output cache-prime commits, and sliding
+# expiry for exact checkpoints.
+APC_WARMUP_CONTRACT_VERSION = 1
 
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
@@ -513,6 +520,9 @@ class APCExactCacheEntry:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    resident_bytes: int = 0
+    ttl_seconds: Optional[float] = None
+    expires_at: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -2855,6 +2865,7 @@ class APCManager:
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
         disk: Optional["DiskBlockStore"] = None,
+        max_resident_bytes: Optional[int] = None,
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -2868,6 +2879,9 @@ class APCManager:
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
+        self.max_resident_bytes = (
+            None if max_resident_bytes is None else max(0, int(max_resident_bytes))
+        )
         if self.disk is not None:
             self.disk.set_write_callbacks(
                 self._record_disk_writes,
@@ -2983,7 +2997,73 @@ class APCManager:
                 self._release_one(b)
 
     def _resident_bytes_locked(self) -> int:
-        return sum(b.resident_bytes() for b in self.pool)
+        return sum(b.resident_bytes() for b in self.pool) + sum(
+            entry.resident_bytes for entry in self._exact_cache.values()
+        )
+
+    @staticmethod
+    def _prompt_cache_resident_bytes(prompt_cache: Sequence[Any]) -> int:
+        def state_tree(value: Any) -> Any:
+            if hasattr(value, "state"):
+                return state_tree(value.state)
+            if isinstance(value, tuple):
+                return tuple(state_tree(item) for item in value)
+            if isinstance(value, list):
+                return [state_tree(item) for item in value]
+            if isinstance(value, dict):
+                return {key: state_tree(item) for key, item in value.items()}
+            return value
+
+        total = 0
+        seen: set[int] = set()
+        for _, value in tree_flatten(state_tree(prompt_cache)):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            nbytes = getattr(value, "nbytes", None)
+            if nbytes is not None:
+                total += int(nbytes)
+        return total
+
+    def _trim_exact_cache_to_budget_locked(self, reserve_bytes: int = 0) -> None:
+        if self.max_resident_bytes is None:
+            return
+        while (
+            self._exact_cache
+            and self._resident_bytes_locked() + reserve_bytes > self.max_resident_bytes
+        ):
+            self._exact_cache.popitem(last=False)
+
+    def _evict_free_resident_block_locked(self) -> bool:
+        block = self._free_head
+        while block is not None and block.resident_bytes() == 0:
+            block = block.next
+        if block is None:
+            return False
+        self._free_remove(block)
+        if (
+            block.block_hash is not None
+            and self.hash_table.get(block.block_hash) is block
+        ):
+            del self.hash_table[block.block_hash]
+            self.stats.evictions += 1
+        block.block_hash = None
+        block.token_ids = ()
+        block.release_components()
+        self._free_push(block)
+        return True
+
+    def _make_resident_room_locked(self, incoming_bytes: int) -> bool:
+        if self.max_resident_bytes is None:
+            return True
+        if incoming_bytes > self.max_resident_bytes:
+            return False
+        self._trim_exact_cache_to_budget_locked(reserve_bytes=incoming_bytes)
+        while self._resident_bytes_locked() + incoming_bytes > self.max_resident_bytes:
+            if not self._evict_free_resident_block_locked():
+                return False
+        return True
 
     def resident_bytes(self) -> int:
         with self.lock:
@@ -3020,6 +3100,13 @@ class APCManager:
         source_cache: Optional[List[Any]] = None
         prefix_len = 0
         with self.lock:
+            now = time.monotonic()
+            for key in [
+                key
+                for key, entry in self._exact_cache.items()
+                if entry.expires_at is not None and entry.expires_at <= now
+            ]:
+                del self._exact_cache[key]
             best_key: Optional[int] = None
             best_entry: Optional[APCExactCacheEntry] = None
             if self._exact_cache_max > 0:
@@ -3038,6 +3125,8 @@ class APCManager:
                         best_entry = entry
 
                 if best_entry is not None and best_key is not None:
+                    if best_entry.ttl_seconds is not None:
+                        best_entry.expires_at = now + best_entry.ttl_seconds
                     self._exact_cache.move_to_end(best_key)
                     prefix_len = len(best_entry.token_ids)
                     source_cache = best_entry.prompt_cache
@@ -3084,7 +3173,18 @@ class APCManager:
                         # races here, the restored tensors are still valid; only
                         # the hit counter lands in the new stats window.
                         if self._exact_cache_max > 0:
-                            storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
+                            source_bytes = self._prompt_cache_resident_bytes(
+                                prompt_cache
+                            )
+                            with self.lock:
+                                memory_eligible = self._make_resident_room_locked(
+                                    source_bytes
+                                )
+                            storage_copy = (
+                                _clone_prompt_cache_for_apc(prompt_cache)
+                                if memory_eligible
+                                else None
+                            )
                             if storage_copy is not None:
                                 promote_key = _sequence_hash(
                                     stored_tokens, extra_hash, self.block_size
@@ -3100,6 +3200,9 @@ class APCManager:
                                                 token_ids=stored_tokens,
                                                 extra_hash=int(extra_hash),
                                                 prompt_cache=storage_copy,
+                                                resident_bytes=self._prompt_cache_resident_bytes(
+                                                    storage_copy
+                                                ),
                                             )
                                         )
                                         self._exact_cache.move_to_end(promote_key)
@@ -3108,6 +3211,7 @@ class APCManager:
                                             > self._exact_cache_max
                                         ):
                                             self._exact_cache.popitem(last=False)
+                                        self._trim_exact_cache_to_budget_locked()
                                 return prompt_cache, disk_prefix_len
                         with self.lock:
                             self.stats.exact_hits += 1
@@ -3136,6 +3240,7 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        ttl_seconds: Optional[float] = None,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
         if len(token_ids) < self.exact_cache_min_tokens:
@@ -3143,6 +3248,23 @@ class APCManager:
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
+        ttl_seconds = (
+            float(ttl_seconds)
+            if ttl_seconds is not None and float(ttl_seconds) > 0
+            else None
+        )
+        disk_eligible = self.disk is not None and ttl_seconds is None
+        source_bytes = self._prompt_cache_resident_bytes(prompt_cache)
+        memory_eligible = self._exact_cache_max > 0
+        if memory_eligible and self.max_resident_bytes is not None:
+            with self.lock:
+                self._trim_exact_cache_to_budget_locked(reserve_bytes=source_bytes)
+                memory_eligible = (
+                    self._resident_bytes_locked() + source_bytes
+                    <= self.max_resident_bytes
+                )
+        if not memory_eligible and not disk_eligible:
+            return False
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
@@ -3161,17 +3283,26 @@ class APCManager:
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
+        resident_bytes = self._prompt_cache_resident_bytes(copied)
         with self.lock:
-            if self._exact_cache_max > 0:
+            if memory_eligible:
                 self._exact_cache[key] = APCExactCacheEntry(
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
+                    resident_bytes=resident_bytes,
+                    ttl_seconds=ttl_seconds,
+                    expires_at=(
+                        time.monotonic() + ttl_seconds
+                        if ttl_seconds is not None
+                        else None
+                    ),
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
                     self._exact_cache.popitem(last=False)
-                stored = True
+                self._trim_exact_cache_to_budget_locked()
+                stored = key in self._exact_cache
         if stored:
             apc_trace(
                 "store",
@@ -3180,7 +3311,7 @@ class APCManager:
                 token_len=len(token_tuple),
                 layers=len(copied),
             )
-        if self.disk is not None:
+        if disk_eligible:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
                 stored = True
@@ -3350,10 +3481,18 @@ class APCManager:
                 and self._exact_cache_max > 0
                 and layer_major_prefix_tokens >= self._layer_major_memory_min_tokens
             ):
-                copied = _clone_layer_major_kv_cache_for_apc(
-                    layer_keys,
-                    layer_values,
-                    layer_major_prefix_tokens,
+                incoming_exact_bytes = sum(
+                    int(x[..., :layer_major_prefix_tokens, :].nbytes)
+                    for x in [*layer_keys, *layer_values]
+                )
+                copied = (
+                    _clone_layer_major_kv_cache_for_apc(
+                        layer_keys,
+                        layer_values,
+                        layer_major_prefix_tokens,
+                    )
+                    if self._make_resident_room_locked(incoming_exact_bytes)
+                    else None
                 )
                 if copied is not None:
                     key = _sequence_hash(token_tuple, extra_hash, self.block_size)
@@ -3361,12 +3500,15 @@ class APCManager:
                         token_ids=token_tuple,
                         extra_hash=int(extra_hash),
                         prompt_cache=copied,
+                        resident_bytes=self._prompt_cache_resident_bytes(copied),
                     )
                     self._exact_cache.move_to_end(key)
                     while len(self._exact_cache) > self._exact_cache_max:
                         self._exact_cache.popitem(last=False)
-                    self.stats.exact_stores += 1
-                    layer_major_stored = True
+                    self._trim_exact_cache_to_budget_locked()
+                    layer_major_stored = key in self._exact_cache
+                    if layer_major_stored:
+                        self.stats.exact_stores += 1
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -3430,6 +3572,16 @@ class APCManager:
                     continue
                 start = i * self.block_size
                 end = start + self.block_size
+                incoming_bytes = sum(
+                    int(x[..., start:end, :].nbytes)
+                    for x in [*layer_keys, *layer_values]
+                )
+                if not self._make_resident_room_locked(incoming_bytes):
+                    self._free_push(b)
+                    if self.disk is None:
+                        break
+                    parent = h
+                    continue
                 # Deep-copy each slice into its own buffer so the block tensor
                 # is decoupled from the caller's cache, which mlx.clear_cache
                 # may release after generation. mx.contiguous alone can return
@@ -3461,6 +3613,7 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
+            snap["max_resident_bytes"] = self.max_resident_bytes
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -4461,7 +4614,8 @@ def from_env(
 ) -> Optional[APCManager]:
     """Build an APCManager when enabled; read knobs from env (default) or
     ``overrides`` (keys: enabled, disk_path, block_size, num_blocks,
-    disk_max_gb) so live settings can drive APC without env mutation."""
+    disk_max_gb, max_resident_bytes) so live settings can drive APC without
+    env mutation."""
     if overrides is not None and "enabled" in overrides:
         enabled = bool(overrides["enabled"])
     else:
@@ -4484,6 +4638,7 @@ def from_env(
 
     block_size = _ov_int("block_size", "APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)
     num_blocks = _ov_int("num_blocks", "APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS)
+    max_resident_bytes = _ov_int("max_resident_bytes", "APC_MAX_RESIDENT_BYTES", 0)
 
     disk: Optional[DiskBlockStore] = None
     if overrides is not None and overrides.get("disk_path") is not None:
@@ -4522,4 +4677,9 @@ def from_env(
         "sha256" if _hash_use_sha256() else "fast",
         bool(disk),
     )
-    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=disk)
+    return APCManager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        disk=disk,
+        max_resident_bytes=(max_resident_bytes if max_resident_bytes > 0 else None),
+    )

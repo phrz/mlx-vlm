@@ -14,6 +14,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
+from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import APCManager, model_apc_mode
 from mlx_vlm.models.cache import KVCache
 
@@ -170,6 +171,51 @@ def test_apc_exact_store_materializes_its_snapshot(monkeypatch):
 
     assert apc.store_exact_cache([1, 2, 3, 4], [cache])
     assert eval_calls
+
+
+def test_apc_exact_store_obeys_resident_byte_budget():
+    cache = KVCache()
+    cache.keys = mx.ones((1, 1, 4, 2))
+    cache.values = mx.ones((1, 1, 4, 2))
+    cache.offset = 4
+
+    admitted = APCManager(
+        num_blocks=4,
+        block_size=4,
+        max_resident_bytes=1024,
+    )
+    admitted.exact_cache_min_tokens = 1
+    assert admitted.store_exact_cache([1, 2, 3, 4], [cache])
+    assert 0 < admitted.resident_bytes() <= 1024
+
+    rejected = APCManager(
+        num_blocks=4,
+        block_size=4,
+        max_resident_bytes=1,
+    )
+    rejected.exact_cache_min_tokens = 1
+    assert not rejected.store_exact_cache([1, 2, 3, 4], [cache])
+    assert rejected.resident_bytes() == 0
+
+
+def test_apc_exact_ttl_is_sliding(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(apc_module.time, "monotonic", lambda: clock[0])
+    cache = KVCache()
+    cache.keys = mx.ones((1, 1, 4, 2))
+    cache.values = mx.ones((1, 1, 4, 2))
+    cache.offset = 4
+    manager = APCManager(num_blocks=4, block_size=4)
+    manager.exact_cache_min_tokens = 1
+    tokens = [1, 2, 3, 4]
+
+    assert manager.store_exact_cache(tokens, [cache], ttl_seconds=10)
+    clock[0] = 109.0
+    assert manager.lookup_exact_cache(tokens + [5])[1] == len(tokens)
+    clock[0] = 118.0
+    assert manager.lookup_exact_cache(tokens + [5])[1] == len(tokens)
+    clock[0] = 129.0
+    assert manager.lookup_exact_cache(tokens + [5]) == (None, 0)
 
 
 @pytest.mark.parametrize("model_factory", [_make_tiny_gemma4, _make_tiny_qwen35])

@@ -2263,7 +2263,103 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
         )
 
     coordinator.store_checkpoint.assert_called_once_with(
-        [1, 2, 3], prompt_cache, extra_hash=0
+        [1, 2, 3], prompt_cache, extra_hash=0, ttl_seconds=None
+    )
+
+
+def test_zero_output_prime_commits_block_apc():
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = False
+    coordinator.lookup.return_value = None
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=SimpleNamespace()),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        results = dispatch_module.stream_generate(
+            model=model,
+            processor=processor,
+            prompt="",
+            input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+            pixel_values=None,
+            mask=None,
+            prompt_cache=prompt_cache,
+            apc_manager=MagicMock(),
+            max_tokens=0,
+        )
+        terminal = next(results)
+        results.close()
+
+    assert terminal.generation_tokens == 0
+    coordinator.commit.assert_called_once_with(
+        prompt_cache,
+        [1, 2, 3, 4],
+        extra_hash=0,
+        skip_first_n_tokens=0,
+        blocks_in_use=[],
+    )
+
+
+def test_zero_output_prime_uses_explicit_checkpoint_boundary():
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = True
+    coordinator.lookup.return_value = None
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=SimpleNamespace()),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    def fake_generate_step(*args, **kwargs):
+        assert kwargs["prompt_cache_checkpoint_len"] == 2
+        kwargs["prompt_cache_checkpoint"](2, kwargs["prompt_cache"])
+        return iter(())
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                apc_manager=MagicMock(),
+                apc_checkpoint_len=2,
+                max_tokens=0,
+            )
+        )
+
+    coordinator.checkpoint_len.assert_not_called()
+    coordinator.store_checkpoint.assert_called_once_with(
+        [1, 2], prompt_cache, extra_hash=0, ttl_seconds=None
     )
 
 

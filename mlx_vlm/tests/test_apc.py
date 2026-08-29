@@ -145,6 +145,49 @@ def test_store_lookup_warm_cache_shapes_and_partial_block_ignored():
     manager.release(matched)
 
 
+def test_block_store_obeys_resident_byte_budget():
+    block_size = 16
+    manager = APCManager(
+        num_blocks=4,
+        block_size=block_size,
+        max_resident_bytes=1100,
+    )
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    assert len(stored) == 1
+    assert manager.resident_bytes() <= 1100
+    manager.release(stored)
+
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched_tokens == block_size
+    manager.release(matched)
+
+
+def test_layer_major_store_checks_budget_before_cloning(monkeypatch):
+    manager = APCManager(
+        num_blocks=4,
+        block_size=16,
+        max_resident_bytes=1,
+    )
+    manager._layer_major_memory_min_tokens = 16
+    token_ids = list(range(32))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+    cloned = False
+
+    def clone(*args, **kwargs):
+        nonlocal cloned
+        cloned = True
+        return []
+
+    monkeypatch.setattr(apc_module, "_clone_layer_major_kv_cache_for_apc", clone)
+
+    assert manager.store_kv_blocks(token_ids, layer_keys, layer_values) == []
+    assert not cloned
+    assert manager.resident_bytes() == 0
+
+
 def test_lookup_stops_at_first_missing_or_mismatched_block():
     block_size = 16
     manager = APCManager(num_blocks=16, block_size=block_size)

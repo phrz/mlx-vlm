@@ -765,6 +765,8 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    requested_checkpoint_len = kwargs.pop("apc_checkpoint_len", None)
+    apc_ttl_seconds = kwargs.pop("apc_ttl_seconds", None)
     image = image or None
     audio = audio or None
     video = video or None
@@ -975,10 +977,18 @@ def stream_generate(
             and apc_coordinator.is_checkpoint
             and reused_prefix_len == 0
         ):
-            exact_checkpoint_len = apc_coordinator.checkpoint_len(
-                full_input_ids_list, multimodal_token_ids
-            )
-            if exact_checkpoint_len <= 0:
+            if requested_checkpoint_len is not None:
+                requested_checkpoint_len = int(requested_checkpoint_len)
+                exact_checkpoint_len = (
+                    requested_checkpoint_len
+                    if 0 < requested_checkpoint_len < len(full_input_ids_list)
+                    else None
+                )
+            else:
+                exact_checkpoint_len = apc_coordinator.checkpoint_len(
+                    full_input_ids_list, multimodal_token_ids
+                )
+            if exact_checkpoint_len is not None and exact_checkpoint_len <= 0:
                 exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
@@ -986,6 +996,7 @@ def stream_generate(
                     full_input_ids_list[:prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
+                    ttl_seconds=apc_ttl_seconds,
                 )
 
         gen = generate_step(
@@ -1041,6 +1052,21 @@ def stream_generate(
         if not generated_tokens:
             prompt_time = time.perf_counter() - tic
             prompt_tps = total_prompt_tokens / prompt_time if prompt_time > 0 else 0.0
+            if prompt_cache_state is not None:
+                prompt_cache_state.update(full_input_ids_list, tracked_cache)
+            if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
+                try:
+                    apc_coordinator.commit(
+                        tracked_cache,
+                        full_input_ids_list,
+                        extra_hash=apc_extra_hash,
+                        skip_first_n_tokens=reused_prefix_len,
+                        blocks_in_use=apc_blocks_in_use,
+                    )
+                except Exception as e:
+                    logger.warning("APC store failed: %s", e)
+                    apc_coordinator.manager.release(apc_blocks_in_use)
+            mx.clear_cache()
             yield GenerationResult(
                 text="",
                 token=None,
@@ -1057,20 +1083,7 @@ def stream_generate(
             return
 
         detokenizer.finalize()
-        yield GenerationResult(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            prompt_tokens=total_prompt_tokens,
-            generation_tokens=n + 1,
-            total_tokens=total_prompt_tokens + n + 1,
-            prompt_tps=prompt_tps,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            cached_tokens=reused_prefix_len,
-            finish_reason=finish_reason,
-        )
-
+        terminal_generation_tps = (n + 1) / (time.perf_counter() - tic)
         # Save cache state for potential reuse on next turn
         all_ids: Optional[List[int]] = None
         if prompt_cache_state is not None:
@@ -1099,6 +1112,19 @@ def stream_generate(
 
         # Cleanup after generation
         mx.clear_cache()
+        yield GenerationResult(
+            text=detokenizer.last_segment,
+            token=token,
+            logprobs=logprobs,
+            prompt_tokens=total_prompt_tokens,
+            generation_tokens=n + 1,
+            total_tokens=total_prompt_tokens + n + 1,
+            prompt_tps=prompt_tps,
+            generation_tps=terminal_generation_tps,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            cached_tokens=reused_prefix_len,
+            finish_reason=finish_reason,
+        )
 
 
 def generate(
